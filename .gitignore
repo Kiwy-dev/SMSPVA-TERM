@@ -1,0 +1,46 @@
+# Python caches and environments
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+.venv-*/
+venv/
+env/
+
+# Test and tooling output
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+*.secret
+*.secrets
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+*.kdbx
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.bak
+credentials*
+secrets*
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

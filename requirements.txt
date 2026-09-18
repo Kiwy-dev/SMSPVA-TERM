@@ -1,0 +1,3 @@
+phonenumbers>=8.13,<10
+rich>=13,<15
+keyring>=24,<26

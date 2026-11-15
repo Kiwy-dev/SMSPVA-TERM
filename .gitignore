@@ -44,3 +44,8 @@ secrets*
 Thumbs.db
 .idea/
 .vscode/
+
+# Node / UI build
+node_modules/
+ui-dist/
+dist/

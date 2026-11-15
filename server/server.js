@@ -160,6 +160,15 @@ function openAppWindow(url) {
     return;
   }
   if (process.platform === 'darwin') {
+    const macChrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+    if (existsSync(macChrome)) {
+      const child = spawn(macChrome, [`--app=${url}`, '--window-size=1180,780'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+      return;
+    }
     const child = spawn('open', [url], { detached: true, stdio: 'ignore' });
     child.unref();
   }

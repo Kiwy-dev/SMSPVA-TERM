@@ -8,6 +8,7 @@ import { SMSPVAClient } from '../server/smspva-client.js';
 import { AccessGate } from '../server/access-gate.js';
 import { Updater, parseVersion, isNewer, checksumFor } from '../server/updater.js';
 import { createServer, isAllowedRemoteIp, isTailscaleIp } from '../server/server.js';
+import { parseKeyValueArgs, readSession } from '../server/remote-cli.js';
 
 function jsonResponse(body, status = 200) {
   return {
@@ -672,5 +673,23 @@ describe('createServer', () => {
     assert.equal(isAllowedRemoteIp('::ffff:100.80.1.2'), true);
     assert.equal(isAllowedRemoteIp('::ffff:192.168.1.50'), false);
     assert.equal(isAllowedRemoteIp('8.8.8.8'), false);
+  });
+
+  it('parses remote-cli key=value args and reads session.json', async () => {
+    assert.deepEqual(parseKeyValueArgs(['section=configuracion', 'open=true', 'voice=0']), {
+      section: 'configuracion',
+      open: true,
+      voice: 0,
+    });
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'smspva-sess-'));
+    try {
+      const sp = path.join(dir, 'session.json');
+      await writeFile(sp, JSON.stringify({ port: 47820, localToken: 'abc123', localUrl: 'http://127.0.0.1:47820/#token=abc123' }), 'utf8');
+      const s = await readSession(sp);
+      assert.equal(s.port, 47820);
+      assert.equal(s.localToken, 'abc123');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

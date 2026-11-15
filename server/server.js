@@ -623,13 +623,41 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const preferredPort = Number(process.env.SMSPVA_PORT || 47820);
   const bindHost = process.env.SMSPVA_TAILSCALE === '0' ? '127.0.0.1' : '0.0.0.0';
   const { server, localToken } = await createServer();
+  const sessionPath = path.join(defaultDataDir(), 'session.json');
 
-  const onListening = () => {
+  const cleanupSession = () => {
+    try { unlink(sessionPath).catch(() => {}); } catch { /* ignore */ }
+  };
+  process.once('SIGINT', () => { cleanupSession(); process.exit(0); });
+  process.once('SIGTERM', () => { cleanupSession(); process.exit(0); });
+
+  const onListening = async () => {
     const addr = server.address();
     const localUrl = `http://127.0.0.1:${addr.port}/#token=${localToken}`;
+    const tailscaleIps = detectTailscaleIps();
+    const shareUrls = tailscaleIps.map((ip) => `http://${ip}:${addr.port}/#token=${localToken}`);
+
+    await mkdir(defaultDataDir(), { recursive: true });
+    await writePrivateFile(
+      sessionPath,
+      JSON.stringify(
+        {
+          pid: process.pid,
+          port: addr.port,
+          localToken,
+          localUrl,
+          tailscaleIps,
+          shareUrls,
+          startedAt: new Date().toISOString(),
+        },
+        null,
+        2,
+      ),
+    );
+
     console.log(`SMSPVA local listo en ${localUrl}`);
-    for (const ip of detectTailscaleIps()) {
-      console.log(`SMSPVA Tailscale: http://${ip}:${addr.port}/#token=${localToken}`);
+    for (const share of shareUrls) {
+      console.log(`SMSPVA Tailscale: ${share}`);
     }
     if (process.env.SMSPVA_NO_OPEN !== '1') {
       openAppWindow(localUrl);

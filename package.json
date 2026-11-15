@@ -8,6 +8,8 @@
   },
   "scripts": {
     "start": "node server/server.js",
+    "link": "node server/remote-cli.js link",
+    "remote": "node server/remote-cli.js",
     "dev:ui": "vite",
     "build:ui": "vite build",
     "test": "node --test --test-concurrency=1 \"tests/server.test.js\"",

@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { chromium } from 'playwright-core';
+import { createWorkbookFile, readWorkbookRows } from '../server/excel-store.js';
 import { createServer } from '../server/server.js';
 
 function jsonResponse(body, status = 200) {
@@ -165,6 +166,184 @@ describe('E2E UI & Remote Controls (Google Chrome)', () => {
       assert.equal(uiState.result.mailOpen, true);
 
       assert.equal(buyCalled, false);
+      assert.deepEqual(errors, []);
+    } finally {
+      await browser.close();
+      await new Promise((resolve) => server.close(resolve));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('links/creates Excel from Catch-All drawer, generates alias + random password + network, and writes to .xlsx', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'smspva-e2e-excel-'));
+    const credDir = path.join(dir, 'creds');
+    const dataDir = path.join(dir, 'data');
+    const createdXlsx = path.join(dir, 'CuentasGeneradas.xlsx');
+    const namedXlsx = path.join(dir, 'CuentasConNombres.xlsx');
+    await createWorkbookFile(namedXlsx, { seedNames: ['Gabriela Vargas Torres'] });
+
+    await mkdir(credDir, { recursive: true });
+    await writeFile(
+      path.join(credDir, 'smspva-imap.json'),
+      JSON.stringify({
+        provider: 'hostinger',
+        host: 'imap.hostinger.com',
+        port: 993,
+        domain: 'kiwyresident.com',
+        user: 'contacto@kiwyresident.com',
+        pass: 'dummy-pass',
+      }),
+      'utf8',
+    );
+
+    const smspvaFetch = async (url) => {
+      const target = String(url);
+      if (target.includes('/userinfo')) {
+        return jsonResponse({ statusCode: 200, data: { balance: '26.4500', name: 'Ana Rojas', karma: 30 } });
+      }
+      if (target.includes('/orders')) {
+        return jsonResponse({
+          statusCode: 200,
+          data: {
+            orders: [
+              {
+                orderId: 99001,
+                phoneNumber: '9611759151',
+                countryCode: '+52',
+                orderExpireIn: 185,
+                service: 'opt16',
+                country: 'MX',
+                status: 'PENDING_SMS',
+                sms: { code: null, fullText: null },
+              },
+            ],
+          },
+        });
+      }
+      if (target.includes('/sms/')) {
+        return jsonResponse({ statusCode: 202, error: { type: 'SMS_NOT_YET_RECEIVED', description: 'Waiting for SMS' } });
+      }
+      if (target.includes('/servicesprices')) {
+        return jsonResponse({
+          statusCode: 200,
+          data: [
+            { service: 'opt16', serviceDescription: 'Instagram', country: 'MX', price: '0.60' },
+          ],
+        });
+      }
+      return jsonResponse({ statusCode: 200, data: { clist: [] } });
+    };
+
+    const { server, localToken } = await createServer({
+      credentialsDir: credDir,
+      dataDir,
+      accessGateOptions: { enabled: false },
+      smspvaClientOptions: { apiKey: 'e2e-mock-key', fetchImpl: smspvaFetch, minIntervalMs: 0 },
+      excelDialogOptions: {
+        saveFile: async () => ({ cancelled: false, filePath: createdXlsx }),
+        pickFile: async () => ({ cancelled: false, filePath: namedXlsx }),
+      },
+    });
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const browser = await chromium.launch({ channel: 'chrome', headless: true });
+
+    try {
+      const page = await browser.newPage({ viewport: { width: 1280, height: 820 } });
+      const errors = [];
+      page.on('pageerror', (err) => errors.push(err.message));
+      page.on('console', (msg) => {
+        if (msg.type() === 'error') errors.push(msg.text());
+      });
+      let imapPollCount = 0;
+      await page.route('**/api/imap/messages**', (route) => {
+        imapPollCount += 1;
+        const urlObj = new URL(route.request().url());
+        const toVal = urlObj.searchParams.get('to') || '';
+        const items =
+          toVal && imapPollCount >= 2
+            ? [
+                {
+                  uid: 101,
+                  date: new Date().toISOString(),
+                  from: 'security@mail.instagram.com',
+                  to: toVal,
+                  subject: '654321 is your Instagram code',
+                  text: 'Use 654321 to verify your account.',
+                  code: '654321',
+                },
+              ]
+            : [];
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ result: items }),
+        });
+      });
+
+      await page.goto(`${baseUrl}/#token=${localToken}`, { waitUntil: 'networkidle' });
+      await page.waitForSelector('text=Expira en 03:');
+      await page.waitForSelector('button:has-text("Copiar sin prefijo")');
+      await page.waitForSelector('button:has-text("Cancelar orden")');
+      await page.waitForSelector('button:has-text("Bloquear número")');
+      await page.click('button:has-text("Instagram")');
+
+      // Click "+ Nuevo correo" -> automatically opens Catch-All drawer and generates alias
+      await page.click('button:has-text("+ Nuevo correo")');
+      await page.waitForSelector('.drawer-panel.open');
+      await page.waitForSelector('text=Ninguno seleccionado');
+      await page.waitForSelector('text=Alias listo');
+
+      // Create new Excel -> invokes saveFile dialog & saves pending alias + password + birthdate + Instagram
+      await page.click('.drawer-panel button:has-text("Crear nuevo")');
+      await page.waitForSelector('text=Fila 2 · Instagram');
+      await page.waitForSelector('text=Datos de la sesión');
+      await page.waitForSelector('text=Fecha de nacimiento:');
+      await page.waitForSelector('button:has-text("Copiar prefijo")');
+      await page.waitForSelector('button:has-text("Copiar número")');
+
+      // Generate a second alias -> writes directly to Row 3
+      await page.click('.drawer-panel button:has-text("+ Generar y copiar alias")');
+      await page.waitForSelector('text=Fila 3 · Instagram');
+
+      const rows = await readWorkbookRows(createdXlsx);
+      assert.equal(rows.length, 3);
+      assert.equal(rows[0].A, 'Correo');
+      assert.equal(rows[0].B, 'Contraseña');
+      assert.equal(rows[0].C, 'Red');
+      assert.equal(rows[0].D, 'Fecha de nacimiento');
+
+      assert.match(rows[1].A, /@kiwyresident\.com$/);
+      assert.ok(rows[1].B.length >= 12);
+      assert.equal(rows[1].C, 'Instagram');
+      assert.match(rows[1].D, /^\d{2}\/\d{2}\/\d{4}$/);
+
+      assert.match(rows[2].A, /@kiwyresident\.com$/);
+      assert.ok(rows[2].B.length >= 12);
+      assert.notEqual(rows[1].B, rows[2].B);
+      assert.equal(rows[2].C, 'Instagram');
+      assert.match(rows[2].D, /^\d{2}\/\d{2}\/\d{4}$/);
+
+      // Switch to existing Excel with Nombre column -> generates human alias using Gabriela Vargas Torres
+      await page.click('.drawer-panel button:has-text("Cambiar")');
+      await page.click('.drawer-panel button:has-text("+ Generar y copiar alias")');
+      await page.waitForSelector('text=Gabriela Vargas Torres');
+      await page.waitForSelector('button:has-text("Copiar nombre")');
+      await page.waitForSelector('button:has-text("Copiar correo")');
+
+      // Wait for 2-second poll to populate the right-side code textbox
+      await page.waitForFunction(() => {
+        const el = document.querySelector('input[aria-label="Código recibido"]');
+        return el && el.value === '654321';
+      }, { timeout: 6000 });
+
+      const namedRows = await readWorkbookRows(namedXlsx);
+      assert.match(namedRows[1].A, /(gabriela|vargas|torres|gvargas).*@kiwyresident\.com$/);
+      assert.equal(namedRows[1].C, 'Instagram');
+      assert.equal(namedRows[1].D, 'Gabriela Vargas Torres');
+      assert.match(namedRows[1].E, /^\d{2}\/\d{2}\/\d{4}$/);
+
       assert.deepEqual(errors, []);
     } finally {
       await browser.close();

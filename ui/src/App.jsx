@@ -184,6 +184,7 @@ export default function App() {
           <Operacion
             smspva={state.smspva}
             imap={state.imap || { configured: false }}
+            excel={state.excel || { configured: false, filePath: '', exists: false }}
             presets={state.presets || []}
             countryPrefs={state.countryPrefs || { favorites: [], recents: [] }}
             operatorPrefs={state.operatorPrefs || { favorites: [], recents: [] }}
@@ -193,6 +194,7 @@ export default function App() {
             onOperatorPrefsChange={(operatorPrefs) => setState((curr) => ({ ...curr, operatorPrefs }))}
             onHistoryChange={(history) => setState((curr) => ({ ...curr, history }))}
             onImapChange={(imap) => setState((curr) => ({ ...curr, imap }))}
+            onExcelChange={(excel) => setState((curr) => ({ ...curr, excel }))}
             onAccountUpdate={(nextAccount) =>
               setState((curr) => ({ ...curr, smspva: { ...curr.smspva, configured: true, account: nextAccount } }))
             }

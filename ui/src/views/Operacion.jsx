@@ -26,9 +26,23 @@ function formatPhone(order) {
   return prefix ? `(${prefix}) ${num}` : num;
 }
 
+function withExpiry(order) {
+  const rawSec = Number(order?.orderExpireIn);
+  const sec = Number.isFinite(rawSec) && rawSec > 0 ? rawSec : 600;
+  return { ...order, _expiresAt: Date.now() + sec * 1000 };
+}
+
+function formatCountdown(remainingMs) {
+  const totalSec = Math.max(0, Math.ceil(remainingMs / 1000));
+  const min = String(Math.floor(totalSec / 60)).padStart(2, '0');
+  const sec = String(totalSec % 60).padStart(2, '0');
+  return `${min}:${sec}`;
+}
+
 export default function Operacion({
   smspva,
   imap = { configured: false },
+  excel = { configured: false, filePath: '', exists: false },
   presets,
   countryPrefs = { favorites: [], recents: [] },
   operatorPrefs = { favorites: [], recents: [] },
@@ -38,6 +52,7 @@ export default function Operacion({
   onOperatorPrefsChange,
   onHistoryChange,
   onImapChange,
+  onExcelChange,
   onAccountUpdate,
   onGoSettings,
   flash,
@@ -55,8 +70,17 @@ export default function Operacion({
   const [voice, setVoice] = useState(0);
 
   const [orders, setOrders] = useState([]);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [busy, setBusy] = useState(false);
   const [mailOpen, setMailOpen] = useState(false);
+  const [newEmailSeq, setNewEmailSeq] = useState(0);
+
+  useEffect(() => {
+    if (orders.length === 0) return;
+    setNowMs(Date.now());
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [orders.length]);
 
   useEffect(() => {
     if (!remoteCmd) return;
@@ -100,7 +124,7 @@ export default function Operacion({
     if (!smspva.configured) return;
     try {
       const res = await api.get('/api/smspva/orders');
-      setOrders(res.result || []);
+      setOrders((res.result || []).map(withExpiry));
     } catch {
       /* silent refresh */
     }
@@ -154,7 +178,7 @@ export default function Operacion({
     [selectedCountry, operatorCode],
   );
 
-  // Polling automático cada 5s para órdenes que aún esperan SMS.
+  // Polling automático cada 2s para órdenes que aún esperan SMS.
   useEffect(() => {
     if (!smspva.configured || orders.length === 0) return;
     const pending = orders.filter((o) => !(o.sms && o.sms.code));
@@ -173,7 +197,7 @@ export default function Operacion({
           /* next tick */
         }
       }
-    }, 5000);
+    }, 2000);
     return () => clearInterval(timer);
   }, [orders, smspva.configured, flash]);
 
@@ -260,10 +284,11 @@ export default function Operacion({
       if (res.account) onAccountUpdate(res.account);
       if (res.history && onHistoryChange) onHistoryChange(res.history);
       if (res.result) {
-        setOrders((curr) => [res.result, ...curr.filter((o) => o.orderId !== res.result.orderId)]);
+        const nextOrder = withExpiry(res.result);
+        setOrders((curr) => [nextOrder, ...curr.filter((o) => o.orderId !== nextOrder.orderId)]);
         recordRecentCountry(targetCountry);
         if (targetOperator) recordRecentOperator(targetOperator);
-        flash(`Número asignado: ${formatPhone(res.result)}`);
+        flash(`Número asignado: ${formatPhone(nextOrder)}`);
       }
     } catch (err) {
       flash(err.message, true);
@@ -331,8 +356,9 @@ export default function Operacion({
       if (res.account) onAccountUpdate(res.account);
       if (res.history && onHistoryChange) onHistoryChange(res.history);
       if (res.result) {
-        setOrders((curr) => [res.result, ...curr]);
-        flash(`Número repetido: ${formatPhone(res.result)}`);
+        const nextOrder = withExpiry(res.result);
+        setOrders((curr) => [nextOrder, ...curr]);
+        flash(`Número repetido: ${formatPhone(nextOrder)}`);
       }
     } catch (err) {
       flash(err.message, true);
@@ -392,9 +418,21 @@ export default function Operacion({
         <div className="card">
           <div className="card-head">
             <h2>Pedir número</h2>
-            <button type="button" className="ghost" disabled={loadingServices} onClick={() => loadServices(true)}>
-              {loadingServices ? 'Cargando…' : 'Actualizar catálogo'}
-            </button>
+            <div className="row" style={{ gap: 8 }}>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => {
+                  setMailOpen(true);
+                  setNewEmailSeq((n) => n + 1);
+                }}
+              >
+                + Nuevo correo
+              </button>
+              <button type="button" className="ghost" disabled={loadingServices} onClick={() => loadServices(true)}>
+                {loadingServices ? 'Cargando…' : 'Actualizar catálogo'}
+              </button>
+            </div>
           </div>
 
           <div className="field">
@@ -533,19 +571,36 @@ export default function Operacion({
           </div>
 
           {orders.length === 0 ? (
-            <p className="muted">No hay órdenes activas en este momento. Cuando pidas un número aparecerá aquí con monitoreo automático cada 5 segundos.</p>
+            <p className="muted">No hay órdenes activas en este momento. Cuando pidas un número aparecerá aquí con monitoreo automático cada 2 segundos.</p>
           ) : (
             <div className="stack">
               {orders.map((ord) => {
                 const fullPhone = formatPhone(ord);
+                const rawPhone = String(ord.phoneNumber || '').trim();
                 const code = ord.sms?.code;
+                const remainingMs = ord._expiresAt ? Math.max(0, ord._expiresAt - nowMs) : null;
+                const expiringSoon = remainingMs !== null && remainingMs <= 60_000;
                 return (
                   <div key={ord.orderId} className="order-card">
                     <div className="card-head">
                       <strong>
                         Orden #{ord.orderId} · {ord.service || 'Servicio'}
                       </strong>
-                      <span className="pill">{ord.status || (code ? 'Recibido' : 'Esperando SMS')}</span>
+                      <div className="row" style={{ gap: 6 }}>
+                        {remainingMs !== null && !code && (
+                          <span
+                            className="pill"
+                            style={
+                              expiringSoon
+                                ? { background: '#fee2e2', color: '#b91c1c', fontWeight: 600 }
+                                : undefined
+                            }
+                          >
+                            {remainingMs > 0 ? `Expira en ${formatCountdown(remainingMs)}` : 'Por expirar'}
+                          </span>
+                        )}
+                        <span className="pill">{ord.status || (code ? 'Recibido' : 'Esperando SMS')}</span>
+                      </div>
                     </div>
 
                     <div className="row">
@@ -555,6 +610,16 @@ export default function Operacion({
                       <button type="button" className="secondary" onClick={() => copyText(fullPhone, 'Número')}>
                         Copiar número
                       </button>
+                      {rawPhone && (
+                        <button
+                          type="button"
+                          className="secondary"
+                          title="Útil si la app ya tiene seleccionado el país (+52, +44, etc.)"
+                          onClick={() => copyText(rawPhone, 'Número sin prefijo')}
+                        >
+                          Copiar sin prefijo
+                        </button>
+                      )}
                     </div>
 
                     {code ? (
@@ -568,7 +633,7 @@ export default function Operacion({
                         </button>
                       </div>
                     ) : (
-                      <p className="muted">Consultando SMS cada 5s…</p>
+                      <p className="muted">Consultando SMS cada 2s…</p>
                     )}
 
                     {ord.sms?.fullText && <p className="muted selectable" style={{ fontSize: 12 }}>{ord.sms.fullText}</p>}
@@ -584,10 +649,22 @@ export default function Operacion({
                           </button>
                         </>
                       )}
-                      <button type="button" className="secondary" disabled={busy} onClick={() => orderAction(ord, 'cancel')}>
-                        Cancelar
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={busy}
+                        title="Cancela la orden antes de recibir SMS y libera el número sin marcarlo como malo"
+                        onClick={() => orderAction(ord, 'cancel')}
+                      >
+                        Cancelar orden
                       </button>
-                      <button type="button" className="danger" disabled={busy} onClick={() => orderAction(ord, 'block')}>
+                      <button
+                        type="button"
+                        className="danger"
+                        disabled={busy}
+                        title="Reporta que el número no sirve o ya está registrado en la app para que no te lo vuelvan a dar"
+                        onClick={() => orderAction(ord, 'block')}
+                      >
                         Bloquear número
                       </button>
                     </div>
@@ -608,6 +685,16 @@ export default function Operacion({
         onClose={() => setMailOpen(false)}
         imap={imap}
         onImapChange={onImapChange}
+        excel={excel}
+        onExcelChange={onExcelChange}
+        activeOrder={orders[0] || null}
+        autoGenerateSeq={newEmailSeq}
+        selectedNetwork={
+          selectedService?.label ||
+          selectedService?.name ||
+          COMMON_APPS.find((a) => a.code === serviceCode)?.label ||
+          ''
+        }
         flash={flash}
       />
     </div>

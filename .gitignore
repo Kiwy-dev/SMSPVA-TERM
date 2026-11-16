@@ -37,6 +37,7 @@ htmlcov/
 *.dump
 *.bak
 credentials*
+!server/credentials.js
 secrets*
 
 # OS/editor files

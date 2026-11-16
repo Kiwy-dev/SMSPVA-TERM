@@ -8,6 +8,14 @@ import { SMSPVAClient } from '../server/smspva-client.js';
 import { AccessGate } from '../server/access-gate.js';
 import { Updater, parseVersion, isNewer, checksumFor } from '../server/updater.js';
 import { createServer, isAllowedRemoteIp, isTailscaleIp } from '../server/server.js';
+import {
+  appendAccountToWorkbook,
+  buildHumanAlias,
+  createWorkbookFile,
+  generateBirthdate,
+  generatePassword,
+  readWorkbookRows,
+} from '../server/excel-store.js';
 import { parseKeyValueArgs, readSession } from '../server/remote-cli.js';
 
 function jsonResponse(body, status = 200) {
@@ -315,6 +323,7 @@ describe('AccessGate', () => {
   });
 });
 
+
 describe('Updater', () => {
   it('parseVersion parses valid semver and rejects invalid values', () => {
     assert.deepEqual(parseVersion('1.2.3'), [1, 2, 3]);
@@ -383,6 +392,7 @@ describe('Updater', () => {
     }
   });
 });
+
 
 describe('createServer', () => {
   async function startTestServer({ gateEnabled = true, gateStatus = 200, smspvaFetchImpl } = {}) {
@@ -689,6 +699,201 @@ describe('createServer', () => {
       assert.equal(s.port, 47820);
       assert.equal(s.localToken, 'abc123');
     } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Excel Store & /api/excel/*', () => {
+  it('generates strong random passwords, creates .xlsx, and appends or fills empty account slots', async () => {
+    const pw1 = generatePassword(12);
+    const pw2 = generatePassword(12);
+    assert.equal(pw1.length, 12);
+    assert.notEqual(pw1, pw2);
+    assert.match(pw1, /[a-z]/);
+    assert.match(pw1, /[A-Z]/);
+    assert.match(pw1, /[0-9]/);
+    assert.match(pw1, /[!@#$%&*]/);
+
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'smspva-excel-unit-'));
+    try {
+      const xlsxPath = path.join(dir, 'MisCuentas.xlsx');
+      await createWorkbookFile(xlsxPath);
+
+      const initialRows = await readWorkbookRows(xlsxPath);
+      assert.equal(initialRows.length, 1);
+      assert.equal(initialRows[0].A, 'Correo');
+      assert.equal(initialRows[0].B, 'Contraseña');
+      assert.equal(initialRows[0].C, 'Red');
+      assert.equal(initialRows[0].D, 'Fecha de nacimiento');
+
+      const bd = generateBirthdate();
+      assert.match(bd, /^\d{2}\/\d{2}\/\d{4}$/);
+
+      const r1 = await appendAccountToWorkbook(xlsxPath, {
+        email: 'u101abc@kiwyresident.com',
+        password: pw1,
+        network: 'Instagram',
+      });
+      assert.equal(r1.rowNumber, 2);
+
+      const r2 = await appendAccountToWorkbook(xlsxPath, {
+        email: 'u202def@kiwyresident.com',
+        password: pw2,
+        network: 'Facebook',
+      });
+      assert.equal(r2.rowNumber, 3);
+
+      const rows = await readWorkbookRows(xlsxPath);
+      assert.equal(rows.length, 3);
+      assert.deepEqual({ A: rows[1].A, B: rows[1].B, C: rows[1].C }, {
+        A: 'u101abc@kiwyresident.com',
+        B: pw1,
+        C: 'Instagram',
+      });
+      assert.deepEqual({ A: rows[2].A, B: rows[2].B, C: rows[2].C }, {
+        A: 'u202def@kiwyresident.com',
+        B: pw2,
+        C: 'Facebook',
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('has no default Excel, prompts save/pick dialogs via API, records accounts, and unlinks cleanly', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'smspva-excel-api-'));
+    const credDir = path.join(dir, 'creds');
+    const dataDir = path.join(dir, 'data');
+    const createdPath = path.join(dir, 'NuevoCuentas.xlsx');
+    const pickedPath = path.join(dir, 'Existente.xlsx');
+    await createWorkbookFile(pickedPath);
+
+    const { server, localToken } = await createServer({
+      credentialsDir: credDir,
+      dataDir,
+      accessGateOptions: { enabled: false },
+      excelDialogOptions: {
+        saveFile: async () => ({ cancelled: false, filePath: createdPath }),
+        pickFile: async () => ({ cancelled: false, filePath: pickedPath }),
+      },
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const headers = { 'x-smspva-token': localToken, 'Content-Type': 'application/json' };
+
+    try {
+      const state0 = await (await fetch(`${baseUrl}/api/state`, { headers })).json();
+      assert.equal(state0.excel.configured, false);
+      assert.equal(state0.excel.filePath, '');
+
+      const errRes = await fetch(`${baseUrl}/api/excel/record-account`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ email: 'a@kiwyresident.com', network: 'Instagram' }),
+      });
+      assert.equal(errRes.status, 400);
+      assert.equal((await errRes.json()).code, 'EXCEL_NOT_CONFIGURED');
+
+      const createRes = await (await fetch(`${baseUrl}/api/excel/create`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({}),
+      })).json();
+      assert.equal(createRes.result.configured, true);
+      assert.equal(createRes.result.filePath, createdPath);
+      assert.equal(createRes.result.exists, true);
+
+      const recRes = await (await fetch(`${baseUrl}/api/excel/record-account`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ email: 'u555xyz@kiwyresident.com', network: 'Instagram' }),
+      })).json();
+      assert.equal(recRes.result.rowNumber, 2);
+      assert.equal(recRes.result.network, 'Instagram');
+      assert.ok(recRes.result.password.length >= 12);
+
+      const rows = await readWorkbookRows(createdPath);
+      assert.equal(rows[1].A, 'u555xyz@kiwyresident.com');
+      assert.equal(rows[1].B, recRes.result.password);
+      assert.equal(rows[1].C, 'Instagram');
+
+      const pickRes = await (await fetch(`${baseUrl}/api/excel/pick`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({}),
+      })).json();
+      assert.equal(pickRes.result.filePath, pickedPath);
+
+      const delRes = await (await fetch(`${baseUrl}/api/excel/config`, {
+        method: 'DELETE',
+        headers,
+      })).json();
+      assert.equal(delRes.result.configured, false);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('generates human-looking emails from the Excel Nombre column without accents or duplicates', async () => {
+    const alias = buildHumanAlias('José Álvarez Torres', 'kiwyresident.com');
+    assert.match(alias, /^[a-z0-9._]+@kiwyresident\.com$/);
+    assert.ok(alias.includes('jose') || alias.includes('alvarez') || alias.includes('jalvarez'));
+
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'smspva-excel-names-'));
+    const credDir = path.join(dir, 'creds');
+    const dataDir = path.join(dir, 'data');
+    const namedXlsx = path.join(dir, 'CuentasConNombres.xlsx');
+    await createWorkbookFile(namedXlsx, {
+      seedNames: ['Gabriela Vargas Torres', 'Enrique Rodríguez Ramírez'],
+    });
+
+    const { server, localToken } = await createServer({
+      credentialsDir: credDir,
+      dataDir,
+      accessGateOptions: { enabled: false },
+      excelDialogOptions: {
+        pickFile: async () => ({ cancelled: false, filePath: namedXlsx }),
+      },
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const headers = { 'x-smspva-token': localToken, 'Content-Type': 'application/json' };
+
+    try {
+      await fetch(`${baseUrl}/api/excel/pick`, { method: 'POST', headers, body: '{}' });
+
+      const r1 = await (await fetch(`${baseUrl}/api/excel/record-account`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ domain: 'kiwyresident.com', network: 'Instagram' }),
+      })).json();
+      assert.equal(r1.result.rowNumber, 2);
+      assert.equal(r1.result.name, 'Gabriela Vargas Torres');
+      assert.match(r1.result.email, /(gabriela|vargas|torres|gvargas).*@kiwyresident\.com$/);
+
+      const r2 = await (await fetch(`${baseUrl}/api/excel/record-account`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ domain: 'kiwyresident.com', network: 'Instagram' }),
+      })).json();
+      assert.equal(r2.result.rowNumber, 3);
+      assert.equal(r2.result.name, 'Enrique Rodríguez Ramírez');
+      assert.match(r2.result.email, /(enrique|rodriguez|ramirez|erodriguez).*@kiwyresident\.com$/);
+      assert.notEqual(r1.result.email, r2.result.email);
+
+      const rows = await readWorkbookRows(namedXlsx);
+      assert.equal(rows.length, 3);
+      assert.equal(rows[1].D, 'Gabriela Vargas Torres');
+      assert.equal(rows[1].A, r1.result.email);
+      assert.match(rows[1].E, /^\d{2}\/\d{2}\/\d{4}$/);
+      assert.equal(rows[1].E, r1.result.birthdate);
+      assert.equal(rows[2].D, 'Enrique Rodríguez Ramírez');
+      assert.equal(rows[2].A, r2.result.email);
+      assert.match(rows[2].E, /^\d{2}\/\d{2}\/\d{4}$/);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
       await rm(dir, { recursive: true, force: true });
     }
   });

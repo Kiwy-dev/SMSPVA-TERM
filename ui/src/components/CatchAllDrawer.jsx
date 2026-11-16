@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import * as api from '../api.js';
 
 const PROVIDERS = {
@@ -29,7 +29,23 @@ function randomAlias(domain) {
   return `u${num}${suffix}@${cleanDomain}`;
 }
 
-export default function CatchAllDrawer({ open, onClose, imap, onImapChange, flash }) {
+function fileNameFromPath(filePath) {
+  const parts = String(filePath || '').split(/[\\/]/);
+  return parts[parts.length - 1] || filePath;
+}
+
+export default function CatchAllDrawer({
+  open,
+  onClose,
+  imap,
+  onImapChange,
+  excel = { configured: false, filePath: '', exists: false },
+  onExcelChange = () => {},
+  selectedNetwork = '',
+  activeOrder = null,
+  autoGenerateSeq = 0,
+  flash,
+}) {
   const [provider, setProvider] = useState(imap?.provider || 'hostinger');
   const [host, setHost] = useState(imap?.host || 'imap.hostinger.com');
   const [port, setPort] = useState(String(imap?.port || 993));
@@ -41,29 +57,39 @@ export default function CatchAllDrawer({ open, onClose, imap, onImapChange, flas
   const [toFilter, setToFilter] = useState('');
   const [messages, setMessages] = useState([]);
   const [busy, setBusy] = useState(false);
+  const [excelBusy, setExcelBusy] = useState(false);
+  const [lastAccount, setLastAccount] = useState(null);
+  const [pendingAlias, setPendingAlias] = useState(null);
+  const inFlightRef = useRef(false);
+  const lastAutoSeqRef = useRef(0);
 
   const loadMessages = useCallback(
-    async (filterValue = toFilter) => {
-      if (!imap?.configured) return;
-      setBusy(true);
+    async (filterValue = toFilter, { silent = false } = {}) => {
+      if (!imap?.configured || inFlightRef.current) return;
+      inFlightRef.current = true;
+      if (!silent) setBusy(true);
       try {
         const qs = filterValue ? `?to=${encodeURIComponent(filterValue)}` : '';
         const res = await api.get(`/api/imap/messages${qs}`);
         setMessages(res.result || []);
       } catch (err) {
-        flash(err.message, true);
+        if (!silent) flash(err.message, true);
       } finally {
-        setBusy(false);
+        inFlightRef.current = false;
+        if (!silent) setBusy(false);
       }
     },
     [imap?.configured, toFilter, flash],
   );
 
   useEffect(() => {
-    if (open && imap?.configured && !editing) {
-      loadMessages();
-    }
-  }, [open, imap?.configured, editing, loadMessages]);
+    if (!open || !imap?.configured || editing) return;
+    loadMessages(toFilter);
+    const id = setInterval(() => {
+      loadMessages(toFilter, { silent: true });
+    }, 2000);
+    return () => clearInterval(id);
+  }, [open, imap?.configured, editing, toFilter, loadMessages]);
 
   const handleSave = async (e) => {
     e.preventDefault();
@@ -104,17 +130,134 @@ export default function CatchAllDrawer({ open, onClose, imap, onImapChange, flas
     }
   };
 
+  const recordAliasToExcel = async ({ email = '', domain = '', network = '' }) => {
+    const res = await api.post('/api/excel/record-account', { email, domain, network });
+    setLastAccount(res.result);
+    setPendingAlias(null);
+    return res.result;
+  };
+
+  const handlePickExcel = async () => {
+    setExcelBusy(true);
+    try {
+      const res = await api.post('/api/excel/pick', {});
+      const next = res.result;
+      if (next?.cancelled) return;
+      onExcelChange(next);
+      if (pendingAlias) {
+        const rec = await recordAliasToExcel({
+          domain: pendingAlias.domain,
+          network: pendingAlias.network,
+        });
+        setToFilter(rec.email);
+        try {
+          await navigator.clipboard.writeText(rec.email);
+        } catch {
+          /* ignore */
+        }
+        flash(`Excel vinculado y correo generado (${rec.email}) en fila ${rec.rowNumber}.`);
+      } else {
+        flash(`Excel vinculado: ${fileNameFromPath(next.filePath)}`);
+      }
+    } catch (err) {
+      flash(err.message, true);
+    } finally {
+      setExcelBusy(false);
+    }
+  };
+
+  const handleCreateExcel = async () => {
+    setExcelBusy(true);
+    try {
+      const res = await api.post('/api/excel/create', { defaultName: 'Cuentas.xlsx' });
+      const next = res.result;
+      if (next?.cancelled) return;
+      onExcelChange(next);
+      if (pendingAlias) {
+        const rec = await recordAliasToExcel({
+          email: pendingAlias.email,
+          domain: pendingAlias.domain,
+          network: pendingAlias.network,
+        });
+        flash(`Excel creado y cuenta guardada en fila ${rec.rowNumber}.`);
+      } else {
+        flash(`Excel creado y vinculado: ${fileNameFromPath(next.filePath)}`);
+      }
+    } catch (err) {
+      flash(err.message, true);
+    } finally {
+      setExcelBusy(false);
+    }
+  };
+
+  const handleUnlinkExcel = async () => {
+    setExcelBusy(true);
+    try {
+      const res = await api.del('/api/excel/config');
+      onExcelChange(res.result);
+      flash('Excel desvinculado.');
+    } catch (err) {
+      flash(err.message, true);
+    } finally {
+      setExcelBusy(false);
+    }
+  };
+
   const handleGenerateAlias = async () => {
     const dom = imap?.domain || (imap?.user?.includes('@') ? imap.user.split('@')[1] : '');
+
+    if (excel?.configured && excel?.exists) {
+      setExcelBusy(true);
+      try {
+        const rec = await recordAliasToExcel({
+          domain: dom || 'tudominio.com',
+          network: selectedNetwork,
+        });
+        setToFilter(rec.email);
+        try {
+          await navigator.clipboard.writeText(rec.email);
+          flash(`Alias copiado y guardado en Excel (fila ${rec.rowNumber}): ${rec.email}`);
+        } catch {
+          flash(`Alias guardado en Excel (fila ${rec.rowNumber}): ${rec.email}`);
+        }
+      } catch (err) {
+        flash(`No se pudo generar y guardar en Excel: ${err.message}`, true);
+      } finally {
+        setExcelBusy(false);
+      }
+      return;
+    }
+
     const alias = randomAlias(dom);
     setToFilter(alias);
     try {
       await navigator.clipboard.writeText(alias);
-      flash(`Alias generado y copiado: ${alias}`);
     } catch {
-      flash(`Alias generado: ${alias}`);
+      /* ignore clipboard failures */
     }
+    setPendingAlias({ email: alias, domain: dom || 'tudominio.com', network: selectedNetwork });
+    flash(`Alias copiado: ${alias}. Selecciona o crea un Excel para guardar su contraseña.`);
   };
+
+  useEffect(() => {
+    if (open && autoGenerateSeq > 0 && autoGenerateSeq !== lastAutoSeqRef.current) {
+      lastAutoSeqRef.current = autoGenerateSeq;
+      if (imap?.configured && !editing) {
+        handleGenerateAlias();
+      }
+    }
+  }, [open, autoGenerateSeq, imap?.configured, editing]);
+
+  const mailCode = messages.find((m) => m.code)?.code || '';
+  const smsCode = activeOrder?.sms?.code || '';
+  const detectedCode = mailCode || smsCode || '';
+  const codeSource = mailCode
+    ? 'Detectado en correo Catch-All'
+    : smsCode
+      ? 'Detectado en SMS activo'
+      : 'Revisando correo y SMS cada 2s…';
+  const phonePrefix = String(activeOrder?.countryCode || '').trim();
+  const phoneWithoutPrefix = String(activeOrder?.phoneNumber || '').trim();
 
   const copyText = async (text, label) => {
     try {
@@ -231,71 +374,243 @@ export default function CatchAllDrawer({ open, onClose, imap, onImapChange, flas
             </form>
           ) : (
             <div className="stack">
+              <div
+                style={{
+                  border: '1px solid var(--border, #e2e8f0)',
+                  borderRadius: 8,
+                  padding: '10px 12px',
+                  background: 'var(--bg-subtle, #f8fafc)',
+                }}
+              >
+                <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600 }}>Excel vinculado</div>
+                    {excel?.configured && excel?.exists ? (
+                      <div className="muted" style={{ fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis' }} title={excel.filePath}>
+                        {fileNameFromPath(excel.filePath)} {selectedNetwork ? `· Red: ${selectedNetwork}` : ''}
+                      </div>
+                    ) : (
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        {excel?.configured && !excel?.exists
+                          ? 'El archivo vinculado ya no existe.'
+                          : 'Ninguno seleccionado (se pedirá dónde guardarlo si creas uno).'}
+                      </div>
+                    )}
+                  </div>
+                  <div className="row" style={{ gap: 6, flexShrink: 0 }}>
+                    <button type="button" className="secondary" disabled={excelBusy} onClick={handlePickExcel}>
+                      {excel?.configured ? 'Cambiar' : 'Seleccionar'}
+                    </button>
+                    <button type="button" className="secondary" disabled={excelBusy} onClick={handleCreateExcel}>
+                      Crear nuevo
+                    </button>
+                    {excel?.configured && (
+                      <button type="button" className="ghost" disabled={excelBusy} onClick={handleUnlinkExcel}>
+                        Desvincular
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {pendingAlias && (
+                  <div className="notice" style={{ marginTop: 8, marginBottom: 0 }}>
+                    <div style={{ fontSize: 12 }}>
+                      Alias listo (<strong>{pendingAlias.email}</strong>). Selecciona un Excel o crea uno nuevo para guardar su contraseña.
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {(lastAccount || activeOrder || toFilter) && (
+                <div className="session-box" aria-label="Datos de la sesión">
+                  <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+                    <strong style={{ fontSize: 13 }}>Datos de la sesión</strong>
+                    {lastAccount?.rowNumber && (
+                      <span className="pill">
+                        Fila {lastAccount.rowNumber} · {lastAccount.network || selectedNetwork || '—'}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="session-row">
+                    <div className="session-val">
+                      <strong>Correo:</strong>{' '}
+                      <code className="selectable">{lastAccount?.email || toFilter || '—'}</code>
+                    </div>
+                    {(lastAccount?.email || toFilter) && (
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={() => copyText(lastAccount?.email || toFilter, 'Correo')}
+                      >
+                        Copiar correo
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="session-row">
+                    <div className="session-val">
+                      <strong>Contraseña:</strong>{' '}
+                      <code className="selectable">{lastAccount?.password || '—'}</code>
+                    </div>
+                    {lastAccount?.password && (
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={() => copyText(lastAccount.password, 'Contraseña')}
+                      >
+                        Copiar clave
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="session-row">
+                    <div className="session-val">
+                      <strong>Nombre completo:</strong>{' '}
+                      <span className="selectable">{lastAccount?.name || '—'}</span>
+                    </div>
+                    {lastAccount?.name && (
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={() => copyText(lastAccount.name, 'Nombre')}
+                      >
+                        Copiar nombre
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="session-row">
+                    <div className="session-val">
+                      <strong>Fecha de nacimiento:</strong>{' '}
+                      <code className="selectable">{lastAccount?.birthdate || '—'}</code>
+                    </div>
+                    {lastAccount?.birthdate && (
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={() => copyText(lastAccount.birthdate, 'Fecha de nacimiento')}
+                      >
+                        Copiar fecha
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="session-row">
+                    <div className="session-val">
+                      <strong>Teléfono:</strong>{' '}
+                      <code className="selectable">{phonePrefix || '—'}</code>
+                      {' | '}
+                      <code className="selectable">{phoneWithoutPrefix || '—'}</code>
+                    </div>
+                    <div className="row" style={{ gap: 6, flexShrink: 0 }}>
+                      {phonePrefix && (
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={() => copyText(phonePrefix, 'Prefijo')}
+                        >
+                          Copiar prefijo
+                        </button>
+                      )}
+                      {phoneWithoutPrefix && (
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={() => copyText(phoneWithoutPrefix, 'Número sin prefijo')}
+                        >
+                          Copiar número
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
               <div className="row">
-                <button type="button" className="primary" onClick={handleGenerateAlias}>
-                  + Generar y copiar alias
+                <button type="button" className="primary" disabled={excelBusy} onClick={handleGenerateAlias}>
+                  {excelBusy ? 'Guardando…' : '+ Generar y copiar alias'}
                 </button>
                 <button type="button" className="secondary" disabled={busy} onClick={() => loadMessages()}>
                   {busy ? 'Leyendo…' : 'Refrescar'}
                 </button>
               </div>
 
-              <label className="field">
-                <span>Filtrar por destinatario (To)</span>
-                <div className="row">
+              <div className="catchall-columns">
+                <div className="stack">
+                  <label className="field">
+                    <span>Filtrar por destinatario (To)</span>
+                    <div className="row">
+                      <input
+                        style={{ flex: 1 }}
+                        type="search"
+                        placeholder="Ej. 355cc@tudominio.com (vacío = todos)"
+                        value={toFilter}
+                        onChange={(e) => setToFilter(e.target.value)}
+                      />
+                      <button type="button" className="secondary" disabled={busy} onClick={() => loadMessages(toFilter)}>
+                        Buscar
+                      </button>
+                    </div>
+                  </label>
+
+                  {messages.length === 0 ? (
+                    <p className="muted">
+                      {busy ? 'Consultando bandeja…' : 'No hay correos recientes que coincidan con el filtro.'}
+                    </p>
+                  ) : (
+                    <div className="stack">
+                      {messages.map((m) => (
+                        <div key={m.uid} className="order-card">
+                          <div className="card-head">
+                            <strong style={{ fontSize: 13 }}>{m.subject}</strong>
+                            <span className="muted" style={{ fontSize: 11 }}>
+                              {m.date ? new Date(m.date).toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' }) : ''}
+                            </span>
+                          </div>
+                          <div className="muted" style={{ fontSize: 12 }}>
+                            Para: <span className="selectable">{m.to || '—'}</span>
+                          </div>
+                          <div className="muted" style={{ fontSize: 12 }}>
+                            De: {m.from || '—'}
+                          </div>
+                          {m.text && (
+                            <p className="muted selectable" style={{ fontSize: 12 }}>
+                              {m.text.slice(0, 280)}
+                            </p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="code-panel">
+                  <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+                    <strong style={{ fontSize: 13 }}>Código recibido</strong>
+                    <span className="pill">Cada 2s</span>
+                  </div>
                   <input
-                    style={{ flex: 1 }}
-                    type="search"
-                    placeholder="Ej. 355cc@tudominio.com (vacío = todos)"
-                    value={toFilter}
-                    onChange={(e) => setToFilter(e.target.value)}
+                    type="text"
+                    readOnly
+                    className="code-textbox"
+                    aria-label="Código recibido"
+                    value={detectedCode}
+                    placeholder="Esperando…"
                   />
-                  <button type="button" className="secondary" disabled={busy} onClick={() => loadMessages(toFilter)}>
-                    Buscar
+                  <div className="muted" style={{ fontSize: 12 }}>
+                    {codeSource}
+                  </div>
+                  <button
+                    type="button"
+                    className="primary"
+                    disabled={!detectedCode}
+                    onClick={() => copyText(detectedCode, 'Código')}
+                  >
+                    Copiar código
                   </button>
                 </div>
-              </label>
-
-              {messages.length === 0 ? (
-                <p className="muted">
-                  {busy ? 'Consultando bandeja…' : 'No hay correos recientes que coincidan con el filtro.'}
-                </p>
-              ) : (
-                <div className="stack">
-                  {messages.map((m) => (
-                    <div key={m.uid} className="order-card">
-                      <div className="card-head">
-                        <strong style={{ fontSize: 13 }}>{m.subject}</strong>
-                        <span className="muted" style={{ fontSize: 11 }}>
-                          {m.date ? new Date(m.date).toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' }) : ''}
-                        </span>
-                      </div>
-                      <div className="muted" style={{ fontSize: 12 }}>
-                        Para: <span className="selectable">{m.to || '—'}</span>
-                      </div>
-                      <div className="muted" style={{ fontSize: 12 }}>
-                        De: {m.from || '—'}
-                      </div>
-                      {m.code && (
-                        <div className="code-box">
-                          <div>
-                            <div className="muted" style={{ fontSize: 11 }}>Código detectado</div>
-                            <strong className="mono selectable">{m.code}</strong>
-                          </div>
-                          <button type="button" className="primary" onClick={() => copyText(m.code, 'Código')}>
-                            Copiar
-                          </button>
-                        </div>
-                      )}
-                      {m.text && (
-                        <p className="muted selectable" style={{ fontSize: 12 }}>
-                          {m.text.slice(0, 280)}
-                        </p>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
+              </div>
             </div>
           )}
         </div>

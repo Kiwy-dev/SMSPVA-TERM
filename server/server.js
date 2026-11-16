@@ -14,6 +14,14 @@ import {
   writeEnvKey,
   writePrivateFile,
 } from './credentials.js';
+import {
+  appendAccountToWorkbook,
+  createWorkbookFile,
+  ensureXlsxExtension,
+  generatePassword,
+  pickExcelFileDialog,
+  saveExcelFileDialog,
+} from './excel-store.js';
 import { fetchCatchAllMessages, testImapConnection } from './imap-client.js';
 import { SMSPVAClient } from './smspva-client.js';
 import { Updater } from './updater.js';
@@ -160,17 +168,11 @@ function openAppWindow(url) {
     return;
   }
   if (process.platform === 'darwin') {
-    const macChrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-    if (existsSync(macChrome)) {
-      const child = spawn(macChrome, [`--app=${url}`, '--window-size=1180,780'], {
-        detached: true,
-        stdio: 'ignore',
-      });
-      child.unref();
-      return;
-    }
-    const child = spawn('open', [url], { detached: true, stdio: 'ignore' });
-    child.unref();
+    // macOS localiza Chrome por nombre donde esté instalado; si no hay Chrome,
+    // abre el navegador predeterminado.
+    execFile('open', ['-na', 'Google Chrome', '--args', `--app=${url}`, '--window-size=1180,780'], (err) => {
+      if (err) execFile('open', [url], () => {});
+    });
   }
 }
 
@@ -182,14 +184,37 @@ export async function createServer({
   accessGateOptions = {},
   updaterOptions = {},
   smspvaClientOptions = {},
+  excelDialogOptions = {},
 } = {}) {
   const localToken = randomBytes(24).toString('hex');
   const apiKeyPath = path.join(credentialsDir, 'smspva-api.env');
   const imapPath = path.join(credentialsDir, 'smspva-imap.json');
+  const excelConfigPath = path.join(dataDir, 'excel.json');
   const presetsPath = path.join(dataDir, 'presets.json');
   const countryPrefsPath = path.join(dataDir, 'country-prefs.json');
   const operatorPrefsPath = path.join(dataDir, 'operator-prefs.json');
   const historyPath = path.join(dataDir, 'history.json');
+
+  const pickExcelFile = excelDialogOptions.pickFile || pickExcelFileDialog;
+  const saveExcelFile = excelDialogOptions.saveFile || saveExcelFileDialog;
+
+  async function loadExcelConfig() {
+    try {
+      const raw = JSON.parse(await readFile(excelConfigPath, 'utf8'));
+      const filePath = String(raw?.filePath || '').trim();
+      if (!filePath) return { configured: false, filePath: '', exists: false };
+      return { configured: true, filePath, exists: existsSync(filePath) };
+    } catch {
+      return { configured: false, filePath: '', exists: false };
+    }
+  }
+
+  async function saveExcelConfig(filePath) {
+    const clean = ensureXlsxExtension(filePath);
+    await mkdir(dataDir, { recursive: true });
+    await writePrivateFile(excelConfigPath, JSON.stringify({ filePath: clean }, null, 2));
+    return { configured: true, filePath: clean, exists: existsSync(clean) };
+  }
 
   const accessGate = new AccessGate({
     enabled: process.env.SMSPVA_ACCESS_GATE !== '0',
@@ -207,6 +232,7 @@ export async function createServer({
   const savedApiKey = (await readEnvKey(apiKeyPath, 'SMSPVA_API_KEY')) || String(process.env.SMSPVA_API_KEY || '').trim();
   const smspva = new SMSPVAClient({
     apiKey: savedApiKey,
+    minIntervalMs: 2000,
     ...smspvaClientOptions,
   });
 
@@ -310,6 +336,7 @@ export async function createServer({
         const countryPrefs = accessGate.unlocked ? await loadPrefs(countryPrefsPath) : { favorites: [], recents: [] };
         const operatorPrefs = accessGate.unlocked ? await loadPrefs(operatorPrefsPath) : { favorites: [], recents: [] };
         const history = accessGate.unlocked ? await loadHistory(historyPath) : [];
+        const excel = accessGate.unlocked ? await loadExcelConfig() : { configured: false, filePath: '', exists: false };
         let imap = { configured: false, provider: 'hostinger', host: 'imap.hostinger.com', port: 993, domain: '', user: '' };
         if (accessGate.unlocked) {
           try {
@@ -344,6 +371,7 @@ export async function createServer({
             account: cachedAccount,
           },
           imap,
+          excel,
           presets,
           countryPrefs,
           operatorPrefs,
@@ -454,6 +482,73 @@ export async function createServer({
         const toFilter = url.searchParams.get('to') || '';
         const messages = await fetchCatchAllMessages(cfg, { toFilter, limit: 25 });
         return send(res, 200, { result: messages });
+      }
+
+      // --- Excel vinculado ---
+      if (req.method === 'POST' && url.pathname === '/api/excel/pick') {
+        const picked = await pickExcelFile();
+        if (picked?.cancelled || !picked?.filePath) {
+          return send(res, 200, { result: { cancelled: true, ...(await loadExcelConfig()) } });
+        }
+        const cfg = await saveExcelConfig(picked.filePath);
+        return send(res, 200, { result: { cancelled: false, ...cfg } });
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/excel/create') {
+        const body = await readJsonBody(req);
+        let targetPath = String(body.filePath || '').trim();
+        if (!targetPath) {
+          const saved = await saveExcelFile(body.defaultName || 'Cuentas.xlsx');
+          if (saved?.cancelled || !saved?.filePath) {
+            return send(res, 200, { result: { cancelled: true, ...(await loadExcelConfig()) } });
+          }
+          targetPath = saved.filePath;
+        }
+        const createdPath = await createWorkbookFile(targetPath);
+        const cfg = await saveExcelConfig(createdPath);
+        return send(res, 200, { result: { cancelled: false, ...cfg } });
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/excel/config') {
+        const body = await readJsonBody(req);
+        const rawPath = String(body.filePath || '').trim();
+        if (!rawPath) return send(res, 400, { error: 'Ingresa una ruta válida para el archivo Excel (.xlsx).' });
+        const targetPath = ensureXlsxExtension(rawPath);
+        if (!existsSync(targetPath)) {
+          if (body.createIfMissing) {
+            await createWorkbookFile(targetPath);
+          } else {
+            return send(res, 404, { error: 'El archivo Excel indicado no existe.' });
+          }
+        }
+        const cfg = await saveExcelConfig(targetPath);
+        return send(res, 200, { result: cfg });
+      }
+
+      if (req.method === 'DELETE' && url.pathname === '/api/excel/config') {
+        await unlink(excelConfigPath).catch(() => {});
+        return send(res, 200, { result: { configured: false, filePath: '', exists: false } });
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/excel/record-account') {
+        const body = await readJsonBody(req);
+        const email = String(body.email || '').trim();
+        const domain = String(body.domain || '').trim();
+        const network = String(body.network || '').trim();
+        if (!email && !domain) {
+          return send(res, 400, { error: 'El correo o dominio es requerido para registrar la cuenta.' });
+        }
+        const cfg = await loadExcelConfig();
+        if (!cfg.configured) {
+          return send(res, 400, { error: 'No hay ningún Excel vinculado.', code: 'EXCEL_NOT_CONFIGURED' });
+        }
+        if (!cfg.exists) {
+          return send(res, 404, { error: 'El archivo Excel vinculado ya no existe en esa ruta.', code: 'EXCEL_NOT_FOUND' });
+        }
+        const password = String(body.password || '').trim() || generatePassword(12);
+        const birthdate = String(body.birthdate || '').trim();
+        const record = await appendAccountToWorkbook(cfg.filePath, { email, domain, password, network, birthdate });
+        return send(res, 200, { result: record });
       }
 
       // --- Presets ---

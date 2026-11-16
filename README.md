@@ -90,6 +90,7 @@ Consultas cada 5 segundos. Sin SMS al aproximarse 580 segundos reporta el númer
 - La API key y los tokens privados nunca deben incluirse en el repositorio, capturas ni archivos de ejemplo.
 - En el CLI de Python, la API key se solicita de forma oculta, se puede leer desde `SMSPVA_API_KEY` y, en macOS/Windows, se guarda en el almacén seguro del sistema.
 - En la aplicación Node.js, las credenciales locales se almacenan en `~/.credentials/` (`kiwyrium-reports.env`, `smspva-update.env`) y nunca deben subirse a Git.
+- Los datos de la app (favoritos, historial, sesión) van en la carpeta estándar del sistema: `~/Library/Application Support/SMSPVA-TERM` (macOS), `%APPDATA%\SMSPVA-TERM` (Windows) o `~/.local/share/SMSPVA-TERM` (Linux). Ambas rutas pueden cambiarse con `SMSPVA_CREDENTIALS_DIR` y `SMSPVA_DATA_DIR`.
 - Usa `.env.example` solo como referencia; el valor real debe permanecer local.
 - Si una clave o token se expone, revócalo y genera otro inmediatamente.
 
